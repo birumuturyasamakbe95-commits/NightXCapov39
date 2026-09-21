@@ -1472,7 +1472,17 @@ M._arSwingDebounce = false
 M.antiLagEnabled = false
 M.fpsBoostEnabled = false
 M._stretchRezConn = nil
-M.batAimbotMode = M.batAimbotMode or "Normal" -- Normal | Bypass (Spectrum)
+M.batAimbotMode = M.batAimbotMode or "Normal" -- Normal | Bypass (Spectrum) | V2 (BloodHounds)
+M.AUTO_BAT_V2_SPEED = tonumber(M.AUTO_BAT_V2_SPEED) or 60
+M.AUTO_BAT_V2_DIST = tonumber(M.AUTO_BAT_V2_DIST) or 1.0
+M.AUTO_BAT_V2_HEIGHT = tonumber(M.AUTO_BAT_V2_HEIGHT) or 1.5
+M.AUTO_BAT_V2_V_OFF = tonumber(M.AUTO_BAT_V2_V_OFF) or 0.0
+M.AUTO_BAT_V2_HIT_DIST = tonumber(M.AUTO_BAT_V2_HIT_DIST) or 4.5
+M.AUTO_BAT_V2_SWING_CD = tonumber(M.AUTO_BAT_V2_SWING_CD) or 0.08
+M._batV2Conn = nil
+M._batV2HitCooldown = false
+M.autoBatV2SwingEnabled = true
+
 M.pingAlertEnabled = false
 M.pingAlertThreshold = 120
 M._pingAlertTask = nil
@@ -1571,11 +1581,11 @@ M.stealBarSize = 420
 M.stealBarPos = nil
 M.Steal = {
     AutoStealEnabled = false,
-    StealRadius = 61,
+    StealRadius = 62,
     StealDuration = 1.3,
-    StopTime = 0.96,
+    StopTime = 0.975,
 }
-M.autoGrabPausePct = 0.73
+M.autoGrabPausePct = 0.75
 M.autoGrabSetDelayRadius = 9
 M.autoGrabStopEnabled = true
 M.autoGrabSetDelayRadius = 9
@@ -3410,14 +3420,25 @@ if not fireproximityprompt then
 end
 
 do
-    local BalenciStealData = {}
-    local balenciHeartbeatConn = nil
+    -- Fox X NightAutosteal core (Scarlet-based) integrated into Capo
+    local FoxStealData = {}
+    local foxHeartbeatConn = nil
+    local isRagdolled = false
+    local isMedusa = false
+    local statusUpdaterConn = nil
 
-    M.Steal.StealRadius = tonumber(M.Steal.StealRadius) or 61
+    M.Steal = M.Steal or {}
+    M.Steal.StealRadius = tonumber(M.Steal.StealRadius) or 62
     M.Steal.StealDuration = tonumber(M.Steal.StealDuration) or 1.3
+    M.Steal.StopTime = tonumber(M.Steal.StopTime) or 0.975
     M.autoGrabSetDelayRadius = tonumber(M.autoGrabSetDelayRadius) or 9
-    M.autoGrabStopTime = tonumber(M.autoGrabStopTime) or 0.96
+    M.autoGrabPausePct = tonumber(M.autoGrabPausePct) or 0.75
+    M.autoGrabStopTime = tonumber(M.autoGrabStopTime) or (M.Steal.StealDuration * M.autoGrabPausePct)
     M.autoGrabStopEnabled = M.autoGrabStopEnabled ~= false
+    M.ragdollStealEnabled = M.ragdollStealEnabled == true
+    M.medusaStealEnabled = M.medusaStealEnabled == true
+    -- Mode % (75/80/85/90) — pause progress at this percent then wait for close range
+    M.stealPauseMode = tonumber(M.stealPauseMode) or 75
 
     local function getHRP()
         local char = player.Character
@@ -3440,18 +3461,18 @@ do
     end
 
     local function getStealRadius()
-        if M.getActiveStealRadius then
-            return tonumber(M.getActiveStealRadius()) or 61
-        end
-        return tonumber(M.Steal and M.Steal.StealRadius) or 61
+        return tonumber(M.Steal and M.Steal.StealRadius) or 62
     end
 
     local function getStealDuration()
         return math.max(tonumber(M.Steal and M.Steal.StealDuration) or 1.3, 0.05)
     end
 
-    local function getStopTime(duration)
-        local stopTime = tonumber(M.autoGrabStopTime) or tonumber(M.Steal and M.Steal.StopTime) or 0.96
+    local function getStopTimeFromMode(duration)
+        duration = duration or getStealDuration()
+        local mode = tonumber(M.stealPauseMode) or math.floor((tonumber(M.autoGrabPausePct) or 0.75) * 100 + 0.5)
+        if mode <= 0 then return nil end
+        local stopTime = (mode / 100) * duration
         return math.clamp(stopTime, 0.05, math.max(duration - 0.01, 0.05))
     end
 
@@ -3462,13 +3483,6 @@ do
         return action:find("Steal", 1, true) ~= nil
             or action:lower():find("steal", 1, true) ~= nil
             or objectText:lower():find("steal", 1, true) ~= nil
-    end
-
-    local function promptPart(prompt)
-        if not prompt then return nil end
-        if prompt.Parent and prompt.Parent:IsA("BasePart") then return prompt.Parent end
-        if prompt.Parent and prompt.Parent.Parent and prompt.Parent.Parent:IsA("BasePart") then return prompt.Parent.Parent end
-        return prompt:FindFirstAncestorWhichIsA("BasePart")
     end
 
     local function findNearestPrompt()
@@ -3485,51 +3499,97 @@ do
             local pods = plot:FindFirstChild("AnimalPodiums")
             if not pods then continue end
             for _, pod in ipairs(pods:GetChildren()) do
-                local base = pod:FindFirstChild("Base")
-                local spawn = base and base:FindFirstChild("Spawn")
-                if spawn and spawn:IsA("BasePart") then
-                    local dist = (spawn.Position - root.Position).Magnitude
-                    if dist < nearestDist and dist <= radius then
-                        local found = nil
-                        local att = spawn:FindFirstChild("PromptAttachment")
-                        if att then
-                            for _, child in ipairs(att:GetChildren()) do
-                                if isStealPrompt(child) then
-                                    found = child
-                                    break
+                pcall(function()
+                    local base = pod:FindFirstChild("Base")
+                    local spawn = base and base:FindFirstChild("Spawn")
+                    if spawn and spawn:IsA("BasePart") then
+                        local dist = (spawn.Position - root.Position).Magnitude
+                        if dist < nearestDist and dist <= radius then
+                            local found = nil
+                            local att = spawn:FindFirstChild("PromptAttachment")
+                            if att then
+                                for _, child in ipairs(att:GetChildren()) do
+                                    if isStealPrompt(child) then
+                                        found = child
+                                        break
+                                    end
                                 end
                             end
-                        end
-                        if not found then
-                            for _, child in ipairs(spawn:GetDescendants()) do
-                                if isStealPrompt(child) then
-                                    found = child
-                                    break
+                            if not found then
+                                for _, child in ipairs(spawn:GetDescendants()) do
+                                    if isStealPrompt(child) then
+                                        found = child
+                                        break
+                                    end
                                 end
                             end
-                        end
-                        if found then
-                            nearestPrompt = found
-                            nearestDist = dist
-                            nearestName = pod.Name
+                            if found then
+                                nearestPrompt = found
+                                nearestDist = dist
+                                nearestName = pod.Name
+                            end
                         end
                     end
-                end
+                end)
             end
         end
-
         return nearestPrompt, nearestName
     end
 
-    local function updateBalenciProgress(progress)
+    local function updateInterruptFlags()
+        if not M.ragdollStealEnabled then
+            isRagdolled = false
+        else
+            local char = player.Character
+            if char then
+                local humanoid = char:FindFirstChildOfClass("Humanoid")
+                if humanoid then
+                    local state = humanoid:GetState()
+                    isRagdolled = (state == Enum.HumanoidStateType.Physics)
+                else
+                    isRagdolled = false
+                end
+            else
+                isRagdolled = false
+            end
+        end
+
+        if not M.medusaStealEnabled then
+            isMedusa = false
+        else
+            local char = player.Character
+            if char then
+                local medusaVal = char:FindFirstChild("Medusa")
+                if medusaVal and medusaVal:IsA("BoolValue") then
+                    isMedusa = medusaVal.Value == true
+                else
+                    isMedusa = false
+                end
+            else
+                isMedusa = false
+            end
+        end
+    end
+
+    local function shouldInterrupt()
+        return (M.ragdollStealEnabled and isRagdolled)
+            or (M.medusaStealEnabled and isMedusa)
+            or not (M.Steal and M.Steal.AutoStealEnabled)
+    end
+
+    if not statusUpdaterConn then
+        statusUpdaterConn = RunService.Heartbeat:Connect(updateInterruptFlags)
+    end
+
+    local function updateFoxProgress(progress)
         progress = math.clamp(tonumber(progress) or 0, 0, 1)
         if M.updateStealProgress then
-            M.updateStealProgress(progress)
+            pcall(function() M.updateStealProgress(progress) end)
         end
     end
 
     local function buildStealData(prompt)
-        if BalenciStealData[prompt] then return BalenciStealData[prompt] end
+        if FoxStealData[prompt] then return FoxStealData[prompt] end
         local data = { hold = {}, trigger = {}, ready = true }
         pcall(function()
             if getconnections then
@@ -3541,127 +3601,166 @@ do
                 end
             end
         end)
-        BalenciStealData[prompt] = data
+        FoxStealData[prompt] = data
         return data
     end
 
-    local function fireBalenciPrompt(prompt, podName, data)
+    local function fireFoxPrompt(prompt, podName, data)
         pcall(function()
-            for _, f in ipairs(data.trigger or {}) do task.spawn(f) end
-        end)
-        pcall(function()
-            local remote = game:GetService("ReplicatedStorage"):FindFirstChild("StealAnimal")
-            if remote and podName and remote:IsA("RemoteEvent") then
-                remote:FireServer(podName)
+            for _, f in ipairs(data.trigger or {}) do
+                task.spawn(f)
             end
-        end)
-        pcall(function()
-            if prompt and prompt.Fire then
-                prompt:Fire()
-            elseif fireproximityprompt then
-                fireproximityprompt(prompt)
+            local rs = game:GetService("ReplicatedStorage")
+            local remote = rs:FindFirstChild("StealAnimal")
+            if remote and podName then
+                pcall(function() remote:FireServer(podName) end)
+            end
+            if prompt then
+                pcall(function()
+                    if fireproximityprompt then
+                        fireproximityprompt(prompt)
+                    elseif prompt.Fire then
+                        prompt:Fire()
+                    end
+                end)
             end
         end)
     end
 
     local function finishAttempt(data)
-        updateBalenciProgress(0)
+        updateFoxProgress(0)
         if data then data.ready = true end
         M.isStealing = false
     end
 
-    local function executeBalenciSteal(prompt, podName)
+    local function executeFoxSteal(prompt, podName)
         if M.isStealing then return end
-        if not (prompt and prompt.Parent) then return end
+        if shouldInterrupt() then return end
+        if not prompt or not prompt.Parent then return end
 
         local data = buildStealData(prompt)
-        if not data or not data.ready then return end
-
+        if not data.ready then return end
         data.ready = false
         M.isStealing = true
-        local duration = getStealDuration()
-        local stopTime = getStopTime(duration)
-        local delayRadius = math.max(tonumber(M.autoGrabSetDelayRadius) or 9, 1)
-        local stealRadius = getStealRadius()
-        local stopEnabled = M.autoGrabStopEnabled ~= false
-        local promptFired = false
-
-        updateBalenciProgress(0)
+        updateFoxProgress(0)
 
         task.spawn(function()
-            for _, f in ipairs(data.hold or {}) do task.spawn(f) end
-            local startTime = tick()
+            for _, f in ipairs(data.hold or {}) do
+                task.spawn(f)
+            end
 
-            if stopEnabled then
-                while M.isStealing and M.Steal.AutoStealEnabled do
-                    local elapsed = tick() - startTime
-                    if elapsed >= stopTime then break end
-                    updateBalenciProgress(math.clamp(elapsed / duration, 0, 1))
-                    if not prompt.Parent then finishAttempt(data); return end
-                    local root = getHRP()
-                    local part = promptPart(prompt)
-                    if root and part and (root.Position - part.Position).Magnitude > stealRadius then
-                        break
-                    end
-                    task.wait()
+            local duration = getStealDuration()
+            local promptFired = false
+            local stopTime = getStopTimeFromMode(duration)
+            local delayRadius = math.max(tonumber(M.autoGrabSetDelayRadius) or 9, 1)
+            local stealRadius = getStealRadius()
+
+            local function distToPrompt()
+                local hrp = getHRP()
+                if not hrp or not prompt or not prompt.Parent then return math.huge end
+                local part = prompt.Parent
+                if part and part:IsA("Attachment") then part = part.Parent end
+                if part and part:IsA("BasePart") then
+                    return (hrp.Position - part.Position).Magnitude
                 end
+                local anc = prompt:FindFirstAncestorWhichIsA("BasePart")
+                if anc then return (hrp.Position - anc.Position).Magnitude end
+                return math.huge
+            end
 
-                local stopProgress = math.clamp(stopTime / duration, 0, 1)
-                updateBalenciProgress(stopProgress)
-
-                local phase2Timeout = math.max(2.99 - stopTime - math.max(duration - stopTime, 0), 0.05)
-                local phase2Start = tick()
+            if stopTime and stopTime > 0 then
+                -- Phase 1: fill to pause %
+                local startTime = tick()
+                local stopProgress = stopTime / duration
                 while M.isStealing and M.Steal.AutoStealEnabled do
-                    if tick() - phase2Start >= phase2Timeout then
+                    if shouldInterrupt() then
                         finishAttempt(data)
-                        task.wait()
-                        local newPrompt, newName = findNearestPrompt()
-                        if newPrompt then executeBalenciSteal(newPrompt, newName) end
                         return
                     end
-                    if not prompt.Parent then finishAttempt(data); return end
-                    local root = getHRP()
-                    local part = promptPart(prompt)
-                    if root and part then
-                        local dist = (root.Position - part.Position).Magnitude
-                        if dist <= delayRadius then
-                            break
-                        elseif dist > stealRadius then
-                            finishAttempt(data)
-                            return
-                        end
+                    local elapsed = tick() - startTime
+                    local progress = math.min(elapsed / duration, stopProgress)
+                    updateFoxProgress(progress)
+                    if elapsed >= stopTime then break end
+                    if not prompt.Parent then break end
+                    if distToPrompt() > stealRadius then break end
+                    task.wait()
+                end
+
+                if not M.isStealing or not M.Steal.AutoStealEnabled or shouldInterrupt() then
+                    finishAttempt(data)
+                    return
+                end
+
+                updateFoxProgress(stopProgress)
+
+                -- Phase 2: wait until within delay radius (or timeout)
+                local phase2Start = tick()
+                local timeout = 2.99
+                local enteredRadius = false
+                while M.isStealing and M.Steal.AutoStealEnabled do
+                    if shouldInterrupt() then
+                        finishAttempt(data)
+                        return
+                    end
+                    if tick() - phase2Start >= timeout then break end
+                    if not prompt.Parent then break end
+                    local dist = distToPrompt()
+                    if dist <= delayRadius then
+                        enteredRadius = true
+                        break
+                    elseif dist > stealRadius then
+                        break
                     end
                     task.wait()
                 end
 
-                if M.isStealing and M.Steal.AutoStealEnabled then
-                    local fillStart = tick()
-                    local fillDuration = math.max(duration - stopTime, 0.05)
-                    while M.isStealing and M.Steal.AutoStealEnabled do
-                        local fp = math.clamp((tick() - fillStart) / fillDuration, 0, 1)
-                        updateBalenciProgress(stopProgress + fp * (1 - stopProgress))
-                        if fp >= 1 and not promptFired then
-                            promptFired = true
-                            fireBalenciPrompt(prompt, podName, data)
-                            break
-                        end
-                        task.wait()
+                if not enteredRadius or not M.isStealing or not M.Steal.AutoStealEnabled or shouldInterrupt() or not prompt.Parent then
+                    finishAttempt(data)
+                    task.wait()
+                    local newPrompt, newName = findNearestPrompt()
+                    if newPrompt then executeFoxSteal(newPrompt, newName) end
+                    return
+                end
+
+                -- Phase 3: finish fill then fire
+                local fillStart = tick()
+                local fillDuration = math.max(duration - stopTime, 0.05)
+                while M.isStealing and M.Steal.AutoStealEnabled do
+                    if shouldInterrupt() then
+                        finishAttempt(data)
+                        return
                     end
+                    local fp = (tick() - fillStart) / fillDuration
+                    local progress = math.min(stopProgress + fp * (1 - stopProgress), 1)
+                    updateFoxProgress(progress)
+                    if progress >= 1 then break end
+                    if not prompt.Parent then break end
+                    if distToPrompt() > stealRadius then break end
+                    task.wait()
+                end
+
+                if M.isStealing and M.Steal.AutoStealEnabled and not shouldInterrupt() and not promptFired then
+                    promptFired = true
+                    fireFoxPrompt(prompt, podName, data)
                 end
             else
+                -- Full hold without pause
+                local startTime = tick()
                 while M.isStealing and M.Steal.AutoStealEnabled do
+                    if shouldInterrupt() then
+                        finishAttempt(data)
+                        return
+                    end
                     local elapsed = tick() - startTime
-                    local progress = math.clamp(elapsed / duration, 0, 1)
-                    updateBalenciProgress(progress)
-                    if not prompt.Parent then break end
-                    local root = getHRP()
-                    local part = promptPart(prompt)
-                    if root and part and (root.Position - part.Position).Magnitude > stealRadius then break end
-                    if elapsed >= duration and not promptFired then
+                    local progress = math.min(elapsed / duration, 1)
+                    updateFoxProgress(progress)
+                    if progress >= 1 and not promptFired then
                         promptFired = true
-                        fireBalenciPrompt(prompt, podName, data)
+                        fireFoxPrompt(prompt, podName, data)
                         break
                     end
+                    if not prompt.Parent then break end
+                    if distToPrompt() > stealRadius then break end
                     task.wait()
                 end
             end
@@ -3671,12 +3770,16 @@ do
         end)
     end
 
-    local function startBalenciSteal()
+    local function startFoxSteal()
         M.Steal.AutoStealEnabled = true
-        M.stealMode = "V2"
+        M.stealMode = M.stealMode or "V2"
         M.autoGrabStopEnabled = true
         M.autoGrabSetDelayRadius = tonumber(M.autoGrabSetDelayRadius) or 9
-        M.autoGrabStopTime = tonumber(M.autoGrabStopTime) or 0.96
+        local dur = getStealDuration()
+        local mode = tonumber(M.stealPauseMode) or 75
+        M.autoGrabPausePct = mode / 100
+        M.autoGrabStopTime = dur * (mode / 100)
+        M.Steal.StopTime = M.autoGrabStopTime
         if M._introUIReady ~= false then
             if M.statusGui then
                 M.statusGui.Enabled = true
@@ -3685,47 +3788,61 @@ do
             end
         end
         if M.updateStealProgress then pcall(function() M.updateStealProgress(0) end) end
-        if balenciHeartbeatConn then return end
-        balenciHeartbeatConn = RunService.Heartbeat:Connect(function()
+        if foxHeartbeatConn then return end
+        foxHeartbeatConn = RunService.Heartbeat:Connect(function()
             if not M.Steal.AutoStealEnabled or M.isStealing then return end
+            if shouldInterrupt() then return end
             local prompt, podName = findNearestPrompt()
-            if prompt then executeBalenciSteal(prompt, podName) end
+            if prompt then executeFoxSteal(prompt, podName) end
         end)
     end
 
-    local function stopBalenciSteal()
-        if balenciHeartbeatConn then
-            pcall(function() balenciHeartbeatConn:Disconnect() end)
-            balenciHeartbeatConn = nil
+    local function stopFoxSteal()
+        if foxHeartbeatConn then
+            pcall(function() foxHeartbeatConn:Disconnect() end)
+            foxHeartbeatConn = nil
         end
         M.isStealing = false
-        updateBalenciProgress(0)
+        updateFoxProgress(0)
     end
 
     function M.startAutoSteal()
-        startBalenciSteal()
+        startFoxSteal()
     end
 
     function M.stopAutoSteal()
         M.Steal.AutoStealEnabled = false
-        stopBalenciSteal()
+        stopFoxSteal()
         if M.updateStealProgress then pcall(function() M.updateStealProgress(0) end) end
     end
 
-    function M.startNormalSteal() startBalenciSteal() end
-    function M.stopNormalSteal() stopBalenciSteal() end
-    function M.startV2Steal() startBalenciSteal() end
-    function M.stopV2Steal() stopBalenciSteal() end
-    function M.startSemiSteal() startBalenciSteal() end
-    function M.stopSemiSteal() stopBalenciSteal() end
-    function M.startV3Steal() startBalenciSteal() end
-    function M.stopV3Steal() stopBalenciSteal() end
+    function M.startNormalSteal() startFoxSteal() end
+    function M.stopNormalSteal() stopFoxSteal() end
+    function M.startV2Steal() startFoxSteal() end
+    function M.stopV2Steal() stopFoxSteal() end
+    function M.startSemiSteal() startFoxSteal() end
+    function M.stopSemiSteal() stopFoxSteal() end
+    function M.startV3Steal() startFoxSteal() end
+    function M.stopV3Steal() stopFoxSteal() end
 
     function M.setStealRadius(radius)
-        M.Steal.StealRadius = tonumber(radius) or 61
+        M.Steal.StealRadius = tonumber(radius) or 62
+        if M.updateStatusRadius then M.updateStatusRadius() end
+    end
+
+    function M.setStealPauseMode(mode)
+        mode = tonumber(mode) or 75
+        if mode < 0 then mode = 0 end
+        if mode > 100 then mode = 100 end
+        M.stealPauseMode = mode
+        M.autoGrabPausePct = mode / 100
+        local dur = getStealDuration()
+        M.autoGrabStopTime = dur * (mode / 100)
+        M.Steal.StopTime = M.autoGrabStopTime
         if M.updateStatusRadius then M.updateStatusRadius() end
     end
 end
+
 
 function M.findBat()
     local char=player.Character;if not char then return nil end
@@ -3925,10 +4042,164 @@ function M._aimbotSwingBat(char, bat)
     pcall(function() bat:Activate() end)
 end
 
+
+-- ===== Bat Aimbot V2 (BloodHounds / Capo Duels style) =====
+function M._findAnyToolV2()
+    local char = player.Character
+    if char then
+        for _, v in ipairs(char:GetChildren()) do
+            if v:IsA("Tool") then return v end
+        end
+    end
+    local bp = player:FindFirstChildOfClass("Backpack")
+    if bp then
+        for _, v in ipairs(bp:GetChildren()) do
+            if v:IsA("Tool") then return v end
+        end
+    end
+    if M.findBatForAimbot then
+        local b = M.findBatForAimbot()
+        if b then return b end
+    end
+    if M.findBat then
+        local b = M.findBat()
+        if b then return b end
+    end
+    return nil
+end
+
+function M._getClosestPlayerV2()
+    local hrp = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil, math.huge end
+    local closest, bestDist = nil, math.huge
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player and p.Character then
+            local tr = p.Character:FindFirstChild("HumanoidRootPart")
+            local ph = p.Character:FindFirstChildOfClass("Humanoid")
+            if tr and ph and ph.Health > 0 then
+                local d = (hrp.Position - tr.Position).Magnitude
+                if d < bestDist then
+                    bestDist = d
+                    closest = p
+                end
+            end
+        end
+    end
+    return closest, bestDist
+end
+
+function M._tryHitBatV2()
+    if M._batV2HitCooldown or M.autoBatV2SwingEnabled == false then return end
+    M._batV2HitCooldown = true
+    local char = player.Character
+    if char then
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        local tool = M._findAnyToolV2()
+        if tool then
+            if tool.Parent ~= char and hum then
+                pcall(function() hum:EquipTool(tool) end)
+            end
+            local remote = tool:FindFirstChildOfClass("RemoteEvent")
+            if remote then
+                pcall(function() remote:FireServer() end)
+            else
+                pcall(function() tool:Activate() end)
+            end
+        end
+    end
+    task.delay(tonumber(M.AUTO_BAT_V2_SWING_CD) or 0.08, function()
+        M._batV2HitCooldown = false
+    end)
+end
+
+function M.stopBatAimbotV2()
+    if M._batV2Conn then
+        pcall(function() M._batV2Conn:Disconnect() end)
+        M._batV2Conn = nil
+    end
+    local c = player.Character
+    local root = c and c:FindFirstChild("HumanoidRootPart")
+    if root then
+        pcall(function() root.AssemblyLinearVelocity = Vector3.zero end)
+    end
+    M._batV2HitCooldown = false
+end
+
+function M.startBatAimbotV2()
+    if not M.safeModeTryStart() then return end
+    -- stop other aimbot modes
+    if M.aimbotConn then pcall(function() M.aimbotConn:Disconnect() end); M.aimbotConn = nil end
+    if M._specBypass and M._specBypass.conn then pcall(function() M._specBypass.conn:Disconnect() end); M._specBypass.conn = nil end
+    pcall(function() RunService:UnbindFromRenderStep("CapoAimbotRotCam") end)
+    M.stopBatAimbotV2()
+    if M.batTPEnabled and M.stopBatTPAimbot then pcall(function() M.stopBatTPAimbot() end) end
+    if M.bypassAimbotEnabled and M.stopBypassAimbot then pcall(function() M.stopBypassAimbot() end) end
+    if M.autoLeftEnabled then M.autoLeftEnabled=false; if M.autoLeftSetVisual then M.autoLeftSetVisual(false) end; M.stopAutoLeft() end
+    if M.autoRightEnabled then M.autoRightEnabled=false; if M.autoRightSetVisual then M.autoRightSetVisual(false) end; M.stopAutoRight() end
+    M._autoTPWasEnabledForBat = false
+    if M.autoTPEnabled then M._autoTPWasEnabledForBat=true; M.stopAutoTP(); if M.setAutoTPVisual then M.setAutoTPVisual(false) end end
+    pcall(function() if M.stopAutoTPForAction then M.stopAutoTPForAction() end end)
+
+    M.autoBatEnabled = true
+    M.autoSwingEnabled = true
+    M.batAimbotMode = "V2"
+    M._batV2HitCooldown = false
+
+    local SPD = tonumber(M.AUTO_BAT_V2_SPEED) or 60
+    local DIST = tonumber(M.AUTO_BAT_V2_DIST) or 1.0
+    local HEIGHT = tonumber(M.AUTO_BAT_V2_HEIGHT) or 1.5
+    local VOFF = tonumber(M.AUTO_BAT_V2_V_OFF) or 0.0
+    local HIT = tonumber(M.AUTO_BAT_V2_HIT_DIST) or 4.5
+
+    M._batV2Conn = RunService.Heartbeat:Connect(function()
+        if not M.autoBatEnabled or tostring(M.batAimbotMode) ~= "V2" then return end
+        local char = player.Character
+        if not char then return end
+        local root = char:FindFirstChild("HumanoidRootPart")
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not root or not hum or hum.Health <= 0 then return end
+
+        local target = select(1, M._getClosestPlayerV2())
+        if target and target.Character then
+            local targetRoot = target.Character:FindFirstChild("HumanoidRootPart")
+            if targetRoot then
+                local targetVel = targetRoot.AssemblyLinearVelocity or targetRoot.Velocity
+                local moveDir = (targetVel.Magnitude > 0.1) and targetVel.Unit or targetRoot.CFrame.LookVector
+                local offset = moveDir * DIST + Vector3.new(0, HEIGHT + VOFF, 0)
+                local desiredPos = targetRoot.Position + offset
+                local toTarget = desiredPos - root.Position
+                if toTarget.Magnitude > 0.5 then
+                    local moveVec = toTarget.Unit * SPD
+                    root.AssemblyLinearVelocity = Vector3.new(moveVec.X, moveVec.Y, moveVec.Z)
+                else
+                    root.AssemblyLinearVelocity = root.AssemblyLinearVelocity * 0.95
+                    if root.AssemblyLinearVelocity.Magnitude < 1 then
+                        root.AssemblyLinearVelocity = Vector3.zero
+                    end
+                end
+                local distToTarget = (root.Position - targetRoot.Position).Magnitude
+                if distToTarget <= HIT then
+                    M._tryHitBatV2()
+                end
+            end
+        else
+            root.AssemblyLinearVelocity = root.AssemblyLinearVelocity * 0.9
+            if root.AssemblyLinearVelocity.Magnitude < 1 then
+                root.AssemblyLinearVelocity = Vector3.zero
+            end
+        end
+    end)
+
+    if M.autoBatSetVisual then pcall(function() M.autoBatSetVisual(true) end) end
+    if M.mobBtnRefs and M.mobBtnRefs.autoBat then pcall(function() M.mobBtnRefs.autoBat(true) end) end
+end
+
+
 function M.startBatAimbot()
     if not M.safeModeTryStart() then return end
     if M.aimbotConn then pcall(function() M.aimbotConn:Disconnect() end); M.aimbotConn = nil end
     if M._specBypass and M._specBypass.conn then pcall(function() M._specBypass.conn:Disconnect() end); M._specBypass.conn = nil end
+    if M.stopBatAimbotV2 then pcall(function() M.stopBatAimbotV2() end) end
     pcall(function() RunService:UnbindFromRenderStep("CapoAimbotRotCam") end)
     if M.batTPEnabled and M.stopBatTPAimbot then pcall(function() M.stopBatTPAimbot() end) end
     if M.bypassAimbotEnabled and M.stopBypassAimbot then pcall(function() M.stopBypassAimbot() end) end
@@ -4023,6 +4294,7 @@ function M.stopBatAimbot()
     if M.aimbotConn then pcall(function() M.aimbotConn:Disconnect() end); M.aimbotConn=nil end
     if M._aimbotCharConn then pcall(function() M._aimbotCharConn:Disconnect() end); M._aimbotCharConn=nil end
     if M._specBypass and M._specBypass.conn then pcall(function() M._specBypass.conn:Disconnect() end); M._specBypass.conn=nil end
+    if M.stopBatAimbotV2 then pcall(function() M.stopBatAimbotV2() end) end
     pcall(function() RunService:UnbindFromRenderStep("CapoAimbotRotCam") end)
     do
         local char=player.Character; local root=char and char:FindFirstChild("HumanoidRootPart"); local hum=char and char:FindFirstChildOfClass("Humanoid")
@@ -4176,8 +4448,11 @@ function M.queueAutoBatStart()
     if M.antiKickEnabled and M.brainrotDetected then return end
     if M.autoLeftEnabled then M.autoLeftEnabled=false; if M.autoLeftSetVisual then M.autoLeftSetVisual(false) end; M.stopAutoLeft() end
     if M.autoRightEnabled then M.autoRightEnabled=false; if M.autoRightSetVisual then M.autoRightSetVisual(false) end; M.stopAutoRight() end
-    if tostring(M.batAimbotMode or "Normal") == "Bypass" then
+    local mode = tostring(M.batAimbotMode or "Normal")
+    if mode == "Bypass" then
         M.startSpectrumBypassAimbot()
+    elseif mode == "V2" then
+        M.startBatAimbotV2()
     else
         M.startBatAimbot()
     end
@@ -9675,7 +9950,7 @@ M.stealBarSize = tonumber(M.stealBarSize) or 420
         if d.antiRagdollEnabled ~= nil then M.antiRagdollEnabled = d.antiRagdollEnabled == true end
         if d.hardHitEnabled ~= nil then M.hardHitEnabled = d.hardHitEnabled == true end
         if d.autoBatEnabled ~= nil then M.autoBatEnabled = d.autoBatEnabled == true end
-        if type(d.batAimbotMode) == "string" and (d.batAimbotMode == "Normal" or d.batAimbotMode == "Bypass") then
+        if type(d.batAimbotMode) == "string" and (d.batAimbotMode == "Normal" or d.batAimbotMode == "Bypass" or d.batAimbotMode == "V2") then
             M.batAimbotMode = d.batAimbotMode
         end
         if d.fpsBoostEnabled ~= nil then M.fpsBoostEnabled = d.fpsBoostEnabled == true end
@@ -9719,7 +9994,8 @@ M.stealBarSize = tonumber(M.stealBarSize) or 420
         if type(d.grabRadius)=="number" then M.Steal.StealRadius=d.grabRadius end
         if type(d.stealDuration)=="number" then M.Steal.StealDuration=d.stealDuration end
         M.Steal.StopTime = (tonumber(M.Steal.StealDuration) or 1.3) * 0.73
-        M.autoGrabPausePct = 0.73
+        M.autoGrabPausePct = 0.75
+M.stealPauseMode = 75
         if type(d.stealMode)=="string" then
 
             if d.stealMode == "Semi" or d.stealMode == "V2" or d.stealMode == "V1" or d.stealMode == "V3" or d.stealMode == "Normal" then
@@ -10019,7 +10295,7 @@ local saveCherryConfig
 function saveCherryConfig()
     if type(writefile)~="function" then return end
     -- Cherry safety: never crash save if tables are missing
-    M.Steal = M.Steal or { StealRadius = 61, StealDuration = 1.3, StopTime = 0.35, AutoStealEnabled = false }
+    M.Steal = M.Steal or { StealRadius = 62, StealDuration = 1.3, StopTime = 0.35, AutoStealEnabled = false }
     M.Semi = M.Semi or { holdMin = 1.3, holdMax = 2.6, entryDelay = 0.3, radius = 10, primeRange = 80 }
     M.KB = M.KB or {}
     CherryConfig = CherryConfig or { Theme = "Black White" }
@@ -10072,7 +10348,7 @@ function saveCherryConfig()
         antiRagdollEnabled=M.antiRagdollEnabled==true,
         hardHitEnabled=M.hardHitEnabled==true,
         autoBatEnabled=M.autoBatEnabled==true,
-        batAimbotMode=(M.batAimbotMode == "Bypass") and "Bypass" or "Normal",
+        batAimbotMode=(M.batAimbotMode == "Bypass" and "Bypass") or (M.batAimbotMode == "V2" and "V2") or "Normal",
         fpsBoostEnabled=M.fpsBoostEnabled==true,
         antiLagEnabled=M.antiLagEnabled==true,
         antiBatEnabled=M.antiBatEnabled==true,
@@ -12570,6 +12846,358 @@ function M.setSpeedBoosterPanelOpen(on)
     pcall(saveCherryConfig)
 end
 
+
+-- =====================================================================
+-- SPEED BYPASS (Miro-style) — Visuals tab toggles the floating GUI
+-- =====================================================================
+M.speedBypassOpen = false
+M.speedBypassEnabled = false
+M.speedBypassPower = 97000
+M.speedBypassMode = "PC"
+M.speedBypassToggleKey = Enum.KeyCode.V
+M._speedBypassGui = nil
+M._speedBypassRunning = false
+M._speedBypassThread = nil
+M._speedBypassBomb = nil
+
+local SPEED_BYPASS_DEPTH = 296
+local SPEED_BYPASS_SPAM_DELAY = 0.12
+
+function M._buildSpeedBypassBomb(power)
+    local spammed = {}
+    table.insert(spammed, {})
+    local z = spammed[1]
+    for _ = 1, SPEED_BYPASS_DEPTH do
+        local nextTable = {}
+        table.insert(z, nextTable)
+        z = nextTable
+    end
+    local mainTable = {}
+    local reps = math.floor((tonumber(power) or 97000) / (SPEED_BYPASS_DEPTH + 2))
+    if reps < 1 then reps = 1 end
+    for _ = 1, reps do
+        table.insert(mainTable, spammed)
+    end
+    return mainTable
+end
+
+function M.stopSpeedBypassEngine()
+    M._speedBypassRunning = false
+    if M._speedBypassThread then
+        pcall(function() task.cancel(M._speedBypassThread) end)
+        M._speedBypassThread = nil
+    end
+    M._speedBypassBomb = nil
+end
+
+function M.startSpeedBypassEngine(power)
+    M.stopSpeedBypassEngine()
+    power = math.clamp(math.floor(tonumber(power) or M.speedBypassPower or 97000), 1, 500000)
+    M.speedBypassPower = power
+    M._speedBypassBomb = M._buildSpeedBypassBomb(power)
+    M._speedBypassRunning = true
+    M.speedBypassEnabled = true
+    M._speedBypassThread = task.spawn(function()
+        while M._speedBypassRunning do
+            if M._speedBypassBomb then
+                pcall(function()
+                    local rrs = game:GetService("RobloxReplicatedStorage")
+                    if rrs and rrs:FindFirstChild("SetPlayerBlockList") then
+                        rrs.SetPlayerBlockList:FireServer(M._speedBypassBomb)
+                    end
+                end)
+            end
+            task.wait(SPEED_BYPASS_SPAM_DELAY)
+        end
+    end)
+end
+
+function M.destroySpeedBypassGui()
+    if M._speedBypassGui then
+        pcall(function() M._speedBypassGui:Destroy() end)
+        M._speedBypassGui = nil
+    end
+    M.speedBypassOpen = false
+end
+
+function M.buildSpeedBypassGui()
+    M.destroySpeedBypassGui()
+    local PlayerGui = player:FindFirstChild("PlayerGui") or player:WaitForChild("PlayerGui", 5)
+    if not PlayerGui then return end
+
+    local GOLD = Color3.fromRGB(255, 215, 0)
+    local GOLD_DIM = Color3.fromRGB(218, 165, 32)
+    local BG = Color3.fromRGB(0, 0, 0)
+    local BG_MED = Color3.fromRGB(15, 15, 15)
+    local BG_BTN = Color3.fromRGB(20, 20, 20)
+    local STROKE = Color3.fromRGB(80, 80, 80)
+    local TEXT_SEC = Color3.fromRGB(200, 200, 200)
+
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = "CapoSpeedBypass"
+    screenGui.ResetOnSpawn = false
+    screenGui.DisplayOrder = 120
+    screenGui.IgnoreGuiInset = true
+    local parented = false
+    if typeof(gethui) == "function" then parented = pcall(function() screenGui.Parent = gethui() end) end
+    if not parented then parented = pcall(function() screenGui.Parent = game:GetService("CoreGui") end) end
+    if not parented then screenGui.Parent = PlayerGui end
+    M._speedBypassGui = screenGui
+    M.speedBypassOpen = true
+
+    local mainFrame = Instance.new("Frame")
+    mainFrame.Name = "Main"
+    mainFrame.Size = UDim2.new(0, 290, 0, 265)
+    mainFrame.Position = UDim2.new(0.5, -145, 0.5, -132)
+    mainFrame.BackgroundColor3 = BG
+    mainFrame.BorderSizePixel = 0
+    mainFrame.Active = true
+    mainFrame.Parent = screenGui
+    Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 8)
+    local mainStroke = Instance.new("UIStroke", mainFrame)
+    mainStroke.Color = STROKE
+    mainStroke.Thickness = 1.5
+
+    -- drag
+    do
+        local dragging, dragStart, startPos = false, nil, nil
+        mainFrame.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = true
+                dragStart = input.Position
+                startPos = mainFrame.Position
+            end
+        end)
+        mainFrame.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = false
+            end
+        end)
+        UIS.InputChanged:Connect(function(input)
+            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+                local delta = input.Position - dragStart
+                mainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+            end
+        end)
+    end
+
+    local titleBar = Instance.new("Frame")
+    titleBar.Size = UDim2.new(1, 0, 0, 35)
+    titleBar.BackgroundColor3 = BG
+    titleBar.BorderSizePixel = 0
+    titleBar.Parent = mainFrame
+    Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 4)
+
+    local titleText = Instance.new("TextLabel")
+    titleText.Size = UDim2.new(1, -40, 1, 0)
+    titleText.Position = UDim2.new(0, 10, 0, 0)
+    titleText.BackgroundTransparency = 1
+    titleText.Text = "Capo X Night Speed Bypass"
+    titleText.TextColor3 = GOLD
+    titleText.Font = Enum.Font.GothamBold
+    titleText.TextSize = 12
+    titleText.TextXAlignment = Enum.TextXAlignment.Left
+    titleText.Parent = titleBar
+
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size = UDim2.new(0, 22, 0, 20)
+    closeBtn.Position = UDim2.new(1, -28, 0.5, -10)
+    closeBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    closeBtn.Text = "X"
+    closeBtn.TextColor3 = GOLD
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.TextSize = 12
+    closeBtn.AutoButtonColor = false
+    closeBtn.Parent = titleBar
+    Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 4)
+    closeBtn.MouseButton1Click:Connect(function()
+        M.destroySpeedBypassGui()
+        if M.setSpeedBypassPanelVisual then pcall(function() M.setSpeedBypassPanelVisual(false) end) end
+    end)
+
+    local content = Instance.new("Frame")
+    content.Position = UDim2.new(0, 10, 0, 42)
+    content.Size = UDim2.new(1, -20, 1, -52)
+    content.BackgroundTransparency = 1
+    content.Parent = mainFrame
+    local lay = Instance.new("UIListLayout")
+    lay.Padding = UDim.new(0, 8)
+    lay.Parent = content
+
+    local function makeRow(height)
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1, 0, 0, height)
+        row.BackgroundColor3 = BG_MED
+        row.BackgroundTransparency = 0.2
+        row.BorderSizePixel = 0
+        row.Parent = content
+        Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+        return row
+    end
+
+    local statusRow = makeRow(34)
+    local statusBtn = Instance.new("TextButton")
+    statusBtn.Size = UDim2.new(1, 0, 1, 0)
+    statusBtn.BackgroundTransparency = 1
+    statusBtn.Text = M.speedBypassEnabled and "STATUS: ENABLED" or "STATUS: DISABLED"
+    statusBtn.TextColor3 = M.speedBypassEnabled and GOLD or TEXT_SEC
+    statusBtn.Font = Enum.Font.GothamBold
+    statusBtn.TextSize = 12
+    statusBtn.AutoButtonColor = false
+    statusBtn.Parent = statusRow
+    local statusStroke = Instance.new("UIStroke", statusRow)
+    statusStroke.Color = M.speedBypassEnabled and GOLD or STROKE
+    statusStroke.Thickness = 1
+
+    local powerRow = makeRow(32)
+    local powerLbl = Instance.new("TextLabel")
+    powerLbl.Size = UDim2.new(0.5, 0, 1, 0)
+    powerLbl.BackgroundTransparency = 1
+    powerLbl.Text = "  Power:"
+    powerLbl.TextColor3 = GOLD
+    powerLbl.Font = Enum.Font.Gotham
+    powerLbl.TextSize = 11
+    powerLbl.TextXAlignment = Enum.TextXAlignment.Left
+    powerLbl.Parent = powerRow
+    local powerInput = Instance.new("TextBox")
+    powerInput.Position = UDim2.new(0.52, 0, 0.5, -11)
+    powerInput.Size = UDim2.new(0.44, 0, 0, 22)
+    powerInput.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+    powerInput.Text = tostring(M.speedBypassPower or 97000)
+    powerInput.TextColor3 = GOLD
+    powerInput.Font = Enum.Font.GothamBold
+    powerInput.TextSize = 12
+    powerInput.Parent = powerRow
+    Instance.new("UICorner", powerInput).CornerRadius = UDim.new(0, 4)
+    Instance.new("UIStroke", powerInput).Color = Color3.fromRGB(60, 60, 60)
+
+    local modeRow = makeRow(28)
+    local modeLbl = Instance.new("TextLabel")
+    modeLbl.Size = UDim2.new(0.28, 0, 1, 0)
+    modeLbl.BackgroundTransparency = 1
+    modeLbl.Text = "  Mode:"
+    modeLbl.TextColor3 = GOLD
+    modeLbl.Font = Enum.Font.Gotham
+    modeLbl.TextSize = 11
+    modeLbl.TextXAlignment = Enum.TextXAlignment.Left
+    modeLbl.Parent = modeRow
+
+    local function makeModeBtn(text, xScale)
+        local btn = Instance.new("TextButton")
+        btn.Position = UDim2.new(xScale, 0, 0.5, -10)
+        btn.Size = UDim2.new(0.3, -6, 0, 20)
+        btn.BackgroundColor3 = BG_BTN
+        btn.Text = text
+        btn.TextColor3 = TEXT_SEC
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = 10
+        btn.AutoButtonColor = false
+        btn.Parent = modeRow
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 5)
+        local st = Instance.new("UIStroke", btn)
+        st.Color = Color3.fromRGB(70, 70, 70)
+        st.Thickness = 1
+        return btn, st
+    end
+    local mobileBtn, mobileStroke = makeModeBtn("Mobile", 0.4)
+    local pcBtn, pcStroke = makeModeBtn("PC", 0.7)
+
+    local function refreshModeUI()
+        local isPC = (M.speedBypassMode or "PC") == "PC"
+        if isPC then
+            pcBtn.BackgroundColor3 = GOLD_DIM
+            pcBtn.TextColor3 = GOLD
+            pcStroke.Color = GOLD
+            mobileBtn.BackgroundColor3 = BG_BTN
+            mobileBtn.TextColor3 = TEXT_SEC
+            mobileStroke.Color = Color3.fromRGB(70, 70, 70)
+        else
+            mobileBtn.BackgroundColor3 = GOLD_DIM
+            mobileBtn.TextColor3 = GOLD
+            mobileStroke.Color = GOLD
+            pcBtn.BackgroundColor3 = BG_BTN
+            pcBtn.TextColor3 = TEXT_SEC
+            pcStroke.Color = Color3.fromRGB(70, 70, 70)
+        end
+    end
+    refreshModeUI()
+
+    local function refreshStatusUI()
+        local on = M.speedBypassEnabled == true
+        statusBtn.Text = on and "STATUS: ENABLED" or "STATUS: DISABLED"
+        statusBtn.TextColor3 = on and GOLD or TEXT_SEC
+        statusStroke.Color = on and GOLD or STROKE
+        mainStroke.Color = on and GOLD or STROKE
+    end
+
+    statusBtn.MouseButton1Click:Connect(function()
+        if M.speedBypassEnabled then
+            M.speedBypassEnabled = false
+            M.stopSpeedBypassEngine()
+        else
+            M.startSpeedBypassEngine(M.speedBypassPower)
+        end
+        refreshStatusUI()
+    end)
+
+    powerInput.FocusLost:Connect(function()
+        local val = tonumber(powerInput.Text)
+        if val then
+            val = math.clamp(math.floor(val + 0.5), 1, 500000)
+            M.speedBypassPower = val
+            powerInput.Text = tostring(val)
+            if M.speedBypassEnabled then
+                M.startSpeedBypassEngine(val)
+            end
+        else
+            powerInput.Text = tostring(M.speedBypassPower or 97000)
+        end
+    end)
+
+    mobileBtn.MouseButton1Click:Connect(function()
+        M.speedBypassMode = "Mobile"
+        M.speedBypassPower = 65000
+        powerInput.Text = "65000"
+        refreshModeUI()
+        if M.speedBypassEnabled then M.startSpeedBypassEngine(65000) end
+    end)
+    pcBtn.MouseButton1Click:Connect(function()
+        M.speedBypassMode = "PC"
+        M.speedBypassPower = 97000
+        powerInput.Text = "97000"
+        refreshModeUI()
+        if M.speedBypassEnabled then M.startSpeedBypassEngine(97000) end
+    end)
+
+    -- keybind toggle
+    if not M._speedBypassKeyConn then
+        M._speedBypassKeyConn = UIS.InputBegan:Connect(function(input, gp)
+            if gp then return end
+            if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode == (M.speedBypassToggleKey or Enum.KeyCode.V) then
+                if M.speedBypassEnabled then
+                    M.speedBypassEnabled = false
+                    M.stopSpeedBypassEngine()
+                else
+                    M.startSpeedBypassEngine(M.speedBypassPower)
+                end
+                if M._speedBypassGui and M._speedBypassGui.Parent then
+                    refreshStatusUI()
+                end
+            end
+        end)
+    end
+end
+
+function M.toggleSpeedBypassGui(force)
+    if force == false or (force == nil and M.speedBypassOpen) then
+        M.destroySpeedBypassGui()
+        return false
+    end
+    M.buildSpeedBypassGui()
+    return true
+end
+
+
 function M.buildGui()
     -- Never hard-block UI forever on intro; allow build after first attempt
     if M._introUIReady == false and M._bootBuildAttempts == nil then
@@ -14060,8 +14688,8 @@ loadstring(game:HttpGet("https://voidexternal.xyz/v2/scrap/89c7f904722893ad75fc2
         end
         saveCherryConfig()
     end)
-    local _batAimModeIdx = (tostring(M.batAimbotMode or "Normal") == "Bypass") and 2 or 1
-    local _, setBatAimbot, setBatAimModeUI = uiExpandToggleRow(PMech, "Bat Aimbot", M.autoBatEnabled == true, {"Normal","Bypass"}, _batAimModeIdx, function(on)
+    local _batAimModeIdx = ({Normal=1, Bypass=2, V2=3})[tostring(M.batAimbotMode or "Normal")] or 1
+    local _, setBatAimbot, setBatAimModeUI = uiExpandToggleRow(PMech, "Bat Aimbot", M.autoBatEnabled == true, {"Normal","Bypass","V2"}, _batAimModeIdx, function(on)
         if on then
             M.autoBatEnabled = true
             if M.queueAutoBatStart then M.queueAutoBatStart() end
@@ -14074,7 +14702,7 @@ loadstring(game:HttpGet("https://voidexternal.xyz/v2/scrap/89c7f904722893ad75fc2
         saveCherryConfig()
     end, function(mode)
         local m = tostring(mode or "Normal")
-        if m ~= "Normal" and m ~= "Bypass" then m = "Normal" end
+        if m ~= "Normal" and m ~= "Bypass" and m ~= "V2" then m = "Normal" end
         M.batAimbotMode = m
         pcall(saveCherryConfig)
         if M.autoBatEnabled then
@@ -14178,7 +14806,7 @@ loadstring(game:HttpGet("https://voidexternal.xyz/v2/scrap/89c7f904722893ad75fc2
     uiSectionHeader(PMech, "STEAL")
 
     M.stealMode = "V2"
-    local stealModeLabels = {"V2"}
+    local stealModeLabels = {"V2", "Semi"}
     local stealDefaultIdx = 1
 
     local _, setAutoSteal, setStealModeUI, regStealSettings = uiExpandToggleRow(
@@ -14189,12 +14817,11 @@ loadstring(game:HttpGet("https://voidexternal.xyz/v2/scrap/89c7f904722893ad75fc2
         stealDefaultIdx,
         function(on)
             M.Steal.AutoStealEnabled = on
-            M.stealMode = "V2"
             if on then M.startAutoSteal() else M.stopAutoSteal() end
             saveCherryConfig()
         end,
         function(newLabel)
-            M.stealMode = "V2"
+            M.stealMode = (newLabel == "Semi") and "Semi" or "V2"
             if M.updateStatusModeBadge then pcall(M.updateStatusModeBadge) end
             M.updateStatusRadius()
             saveCherryConfig()
@@ -14203,22 +14830,68 @@ loadstring(game:HttpGet("https://voidexternal.xyz/v2/scrap/89c7f904722893ad75fc2
     M.setInstaGrab = setAutoSteal
     M.setStealModeUI = setStealModeUI
 
-    local v2Box = Instance.new("Frame"); v2Box.BackgroundTransparency=1; v2Box.Size=UDim2.new(1,0,0,0); v2Box.AutomaticSize=Enum.AutomaticSize.Y
+    local v2Box = Instance.new("Frame"); v2Box.BackgroundTransparency=1; v2Box.Size=UDim2.new(1,0,0,0); v2Box.AutomaticSize=Enum.AutomaticSize.Y; v2Box.Visible=true
     local v2Lay = Instance.new("UIListLayout"); v2Lay.Padding=UDim.new(0,6); v2Lay.Parent=v2Box
-    local _, srBox = uiNumberRow(v2Box, "Grab Radius", M.Steal.StealRadius, 0.5, 300, function(v)
-        M.Steal.StealRadius = v; M.setStealRadius(v); M.updateStatusRadius(); saveCherryConfig()
+    local _, srBox = uiNumberRow(v2Box, "Grab Radius", tonumber(M.Steal.StealRadius) or 62, 0.5, 300, function(v)
+        M.Steal.StealRadius = v
+        if M.setStealRadius then M.setStealRadius(v) end
+        M.updateStatusRadius()
+        saveCherryConfig()
     end)
     M.radInput = srBox
-    local _, sdBox = uiNumberRow(v2Box, "Hold Duration", M.Steal.StealDuration, 0.1, 10, function(v)
+    local _, sdBox = uiNumberRow(v2Box, "Hold Duration", tonumber(M.Steal.StealDuration) or 1.3, 0.1, 10, function(v)
         M.Steal.StealDuration = v
+        local mode = tonumber(M.stealPauseMode) or 75
+        M.autoGrabPausePct = mode / 100
+        M.autoGrabStopTime = v * (mode / 100)
+        M.Steal.StopTime = M.autoGrabStopTime
         saveCherryConfig()
     end)
     M.durationBox = sdBox
+    M.stealPauseMode = tonumber(M.stealPauseMode) or 75
+    local _, pauseBox = uiNumberRow(v2Box, "Pause % (Semi)", M.stealPauseMode, 0, 100, function(v)
+        if M.setStealPauseMode then
+            M.setStealPauseMode(v)
+        else
+            local pct = math.clamp(tonumber(v) or 75, 0, 100)
+            M.stealPauseMode = pct
+            M.autoGrabPausePct = pct / 100
+            local dur = tonumber(M.Steal.StealDuration) or 1.3
+            M.autoGrabStopTime = dur * (pct / 100)
+            M.Steal.StopTime = M.autoGrabStopTime
+        end
+        saveCherryConfig()
+    end)
+    M.pausePctBox = pauseBox
+    local _, setRagdollSteal = uiToggleRow(v2Box, "Ragdoll Steal", M.ragdollStealEnabled == true, function(on)
+        M.ragdollStealEnabled = on == true
+        saveCherryConfig()
+    end)
+    local _, setMedusaSteal = uiToggleRow(v2Box, "Medusa Steal", M.medusaStealEnabled == true, function(on)
+        M.medusaStealEnabled = on == true
+        saveCherryConfig()
+    end)
     local _, setAutoRadius = uiToggleRow(v2Box, "Auto Radius", M.autoRadiusEnabled, function(on)
         M.autoRadiusEnabled = on; M.updateStatusRadius(); saveCherryConfig()
     end)
     M.setAutoRadiusVisual = setAutoRadius
     regStealSettings("V2", v2Box)
+    regStealSettings("Semi", v2Box)
+    v2Box.Visible = true
+    pcall(function()
+        v2Box:GetPropertyChangedSignal("Visible"):Connect(function()
+            if not v2Box.Visible then v2Box.Visible = true end
+        end)
+    end)
+
+    regStealSettings("Semi", v2Box)
+    -- Force settings panel visible at all times
+    v2Box.Visible = true
+    pcall(function()
+        v2Box:GetPropertyChangedSignal("Visible"):Connect(function()
+            if not v2Box.Visible then v2Box.Visible = true end
+        end)
+    end)
 
     local _, sbBox = uiNumberRow(PMech, "Steal Bar Size", M.stealBarSize or 220, 160, 480, function(v)
         local n = tonumber(v)
@@ -14302,6 +14975,18 @@ loadstring(game:HttpGet("https://voidexternal.xyz/v2/scrap/89c7f904722893ad75fc2
 
 
     uiSectionHeader(PVis, "VISION")
+    local _, setSpeedBypassPanel = uiToggleRow(PVis, "Speed Bypass Panel", M.speedBypassOpen == true, function(on)
+        if on then
+            M.buildSpeedBypassGui()
+        else
+            M.destroySpeedBypassGui()
+        end
+        M.speedBypassOpen = on == true
+        pcall(saveCherryConfig)
+    end)
+    M.setSpeedBypassPanelVisual = setSpeedBypassPanel
+
+
     -- FPS Boost disabled per request; Anti Lag re-added as a toggle
     M.fpsBoostEnabled = false
     pcall(function() if M.disableFpsBoost then M.disableFpsBoost() end end)
