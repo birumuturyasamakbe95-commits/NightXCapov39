@@ -5149,68 +5149,59 @@ function M.stopAntiBat()
     end
 end
 
--- Hold Inf Jump (Lunar Anti Bat style): SPACE/Touch hold → Y=55 while held
+-- Inf Jump (AntiBat style): JumpRequest + Space/Touch hold → Y=55
 M._infJumpHoldActive = false
 M._infJumpInputBegan = nil
 M._infJumpInputEnded = nil
-M._infJumpTouchStart = nil
-M._infJumpTouchEnd = nil
 M._infJumpRequestConn = nil
 
-local function _capoEnsureInfJumpInputHooks()
+function M.startHoldJump()
+    if M._holdJumpConn then return end
+    M._infJumpHoldActive = false
+
     if not M._infJumpInputBegan then
         M._infJumpInputBegan = UIS.InputBegan:Connect(function(input, gp)
             if gp then return end
-            if input.KeyCode == Enum.KeyCode.Space then
+            if not M.holdJumpEnabled then return end
+            if input.KeyCode == Enum.KeyCode.Space or input.UserInputType == Enum.UserInputType.Touch then
                 M._infJumpHoldActive = true
             end
         end)
     end
     if not M._infJumpInputEnded then
         M._infJumpInputEnded = UIS.InputEnded:Connect(function(input)
-            if input.KeyCode == Enum.KeyCode.Space then
+            if input.KeyCode == Enum.KeyCode.Space or input.UserInputType == Enum.UserInputType.Touch then
                 M._infJumpHoldActive = false
             end
         end)
     end
-    if not M._infJumpTouchStart then
-        M._infJumpTouchStart = UIS.TouchStarted:Connect(function(input, gp)
-            if not gp then
-                M._infJumpHoldActive = true
+    if not M._infJumpRequestConn then
+        M._infJumpRequestConn = UIS.JumpRequest:Connect(function()
+            if not M.holdJumpEnabled then return end
+            local char = Players.LocalPlayer.Character
+            if not char then return end
+            local root = char:FindFirstChild("HumanoidRootPart")
+            if root then
+                pcall(function()
+                    root.Velocity = Vector3.new(root.Velocity.X, 55, root.Velocity.Z)
+                    root.AssemblyLinearVelocity = Vector3.new(root.AssemblyLinearVelocity.X, 55, root.AssemblyLinearVelocity.Z)
+                end)
             end
         end)
     end
-    if not M._infJumpTouchEnd then
-        M._infJumpTouchEnd = UIS.TouchEnded:Connect(function()
-            M._infJumpHoldActive = false
-        end)
-    end
-end
 
-local function _capoInfJumpHeartbeatTick()
-    -- Active if either dedicated holdJump (AntiBat row) OR main Inf Jump toggle is on
-    local active = (M.holdJumpEnabled == true) or (M.infJumpEnabled == true)
-    if not active or not M._infJumpHoldActive then return end
-    local char = player.Character
-    if not char then return end
-    local root = char:FindFirstChild("HumanoidRootPart")
-    if not root then return end
-    pcall(function()
-        local v = root.Velocity
-        if v.Y < 55 then
-            root.Velocity = Vector3.new(v.X, 55, v.Z)
-        end
-        local av = root.AssemblyLinearVelocity
-        if av.Y < 55 then
-            root.AssemblyLinearVelocity = Vector3.new(av.X, 55, av.Z)
+    M._holdJumpConn = RunService.Heartbeat:Connect(function()
+        if not M.holdJumpEnabled or not M._infJumpHoldActive then return end
+        local char = Players.LocalPlayer.Character
+        if not char then return end
+        local root = char:FindFirstChild("HumanoidRootPart")
+        if root then
+            pcall(function()
+                root.Velocity = Vector3.new(root.Velocity.X, 55, root.Velocity.Z)
+                root.AssemblyLinearVelocity = Vector3.new(root.AssemblyLinearVelocity.X, 55, root.AssemblyLinearVelocity.Z)
+            end)
         end
     end)
-end
-
-function M.startHoldJump()
-    _capoEnsureInfJumpInputHooks()
-    if M._holdJumpConn then return end
-    M._holdJumpConn = RunService.Heartbeat:Connect(_capoInfJumpHeartbeatTick)
 end
 
 function M.stopHoldJump()
@@ -7526,7 +7517,6 @@ function M.stopManualInfJumpLoop()
 end
 
 function M.startHoldInfJump()
-    -- Lunar Hold Inf Jump: SPACE/Touch held → keep Y at 55
     if M.holdInfJumpConn then
         pcall(function() M.holdInfJumpConn:Disconnect() end)
         M.holdInfJumpConn = nil
@@ -7543,35 +7533,40 @@ function M.startHoldInfJump()
         end)
         M.infJumpThread = nil
     end
-    _capoEnsureInfJumpInputHooks()
-    -- Also mirror IsKeyDown for PC when JumpRequest-style hold is missed
     M.holdInfJumpConn = RunService.Heartbeat:Connect(function()
         if not M.infJumpEnabled then return end
-        -- Lunar: track space via IsKeyDown as backup
-        if UIS:IsKeyDown(Enum.KeyCode.Space) then
-            M._infJumpHoldActive = true
-        end
-        if not M._infJumpHoldActive then return end
         local char = player.Character
         if not char then return end
         local root = char:FindFirstChild("HumanoidRootPart")
-        if not root then return end
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not root or not hum then return end
+        local isJumpHeld = UIS:IsKeyDown(Enum.KeyCode.Space) or (hum.Jump == true)
+        -- RitualHub uses Velocity; prefer AssemblyLinearVelocity with Velocity fallback
+        local vx, vy, vz
         pcall(function()
+            local v = root.AssemblyLinearVelocity
+            vx, vy, vz = v.X, v.Y, v.Z
+        end)
+        if vx == nil then
             local v = root.Velocity
-            if v.Y < 55 then
-                root.Velocity = Vector3.new(v.X, 55, v.Z)
-            end
-            local av = root.AssemblyLinearVelocity
-            if av.Y < 55 then
-                root.AssemblyLinearVelocity = Vector3.new(av.X, 55, av.Z)
+            vx, vy, vz = v.X, v.Y, v.Z
+        end
+        if isJumpHeld and vy < 35 then
+            local nv = Vector3.new(vx, 55, vz)
+            pcall(function() root.AssemblyLinearVelocity = nv end)
+            pcall(function() root.Velocity = nv end)
+        end
+        -- re-read after possible boost for fall clamp
+        pcall(function()
+            local v = root.AssemblyLinearVelocity or root.Velocity
+            if v.Y < -120 then
+                local nv = Vector3.new(v.X, -120, v.Z)
+                root.AssemblyLinearVelocity = nv
+                root.Velocity = nv
             end
         end)
     end)
     M.infJumpThread = M.holdInfJumpConn
-    -- ensure holdJump path also running so shared tick covers both toggles
-    if M.holdJumpEnabled and not M._holdJumpConn then
-        pcall(function() M.startHoldJump() end)
-    end
 end
 
 function M.stopHoldInfJump()
@@ -13763,11 +13758,11 @@ end
 
 function M.buildAntiTpBatGui()
     M.destroyAntiTpBatGui()
-    local YELLOW = Color3.fromRGB(255, 215, 0)
-    local YELLOW_SOFT = Color3.fromRGB(255, 230, 120)
-    local BLACK = Color3.fromRGB(0, 0, 0)
-    local BLACK_SOFT = Color3.fromRGB(8, 8, 8)
-    local BLACK_BTN = Color3.fromRGB(12, 12, 12)
+    local GOLD = Color3.fromRGB(255, 215, 0)
+    local GOLD_DIM = Color3.fromRGB(218, 165, 32)
+    local BG = Color3.fromRGB(0, 0, 0)
+    local BG_MED = Color3.fromRGB(15, 15, 15)
+    local TEXT_SEC = Color3.fromRGB(200, 200, 200)
 
     local PlayerGui = player:FindFirstChild("PlayerGui") or player:WaitForChild("PlayerGui", 5)
     local screenGui = Instance.new("ScreenGui")
@@ -13786,16 +13781,14 @@ function M.buildAntiTpBatGui()
     main.Name = "Main"
     main.Size = UDim2.new(0, 280, 0, 140)
     main.Position = UDim2.new(0.5, -140, 0.5, -70)
-    main.BackgroundColor3 = BLACK
-    main.BackgroundTransparency = 0
+    main.BackgroundColor3 = BG
     main.BorderSizePixel = 0
     main.Active = true
     main.Parent = screenGui
     Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
     local mainStroke = Instance.new("UIStroke", main)
-    mainStroke.Color = YELLOW
-    mainStroke.Thickness = 1.8
-    mainStroke.Transparency = 0.15
+    mainStroke.Color = GOLD_DIM
+    mainStroke.Thickness = 1.6
 
     -- drag
     do
@@ -13822,8 +13815,7 @@ function M.buildAntiTpBatGui()
 
     local titleBar = Instance.new("Frame", main)
     titleBar.Size = UDim2.new(1, 0, 0, 36)
-    titleBar.BackgroundColor3 = BLACK
-    titleBar.BackgroundTransparency = 0
+    titleBar.BackgroundColor3 = BG
     titleBar.BorderSizePixel = 0
     Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 8)
 
@@ -13832,7 +13824,7 @@ function M.buildAntiTpBatGui()
     title.Position = UDim2.new(0, 12, 0, 0)
     title.BackgroundTransparency = 1
     title.Text = "Capo X Night Anti Tp Bat"
-    title.TextColor3 = YELLOW
+    title.TextColor3 = GOLD
     title.Font = Enum.Font.GothamBold
     title.TextSize = 13
     title.TextXAlignment = Enum.TextXAlignment.Left
@@ -13840,17 +13832,13 @@ function M.buildAntiTpBatGui()
     local closeBtn = Instance.new("TextButton", titleBar)
     closeBtn.Size = UDim2.new(0, 24, 0, 22)
     closeBtn.Position = UDim2.new(1, -30, 0.5, -11)
-    closeBtn.BackgroundColor3 = BLACK_BTN
+    closeBtn.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
     closeBtn.Text = "X"
-    closeBtn.TextColor3 = YELLOW
+    closeBtn.TextColor3 = GOLD
     closeBtn.Font = Enum.Font.GothamBold
     closeBtn.TextSize = 12
     closeBtn.AutoButtonColor = false
     Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 4)
-    local closeSt = Instance.new("UIStroke", closeBtn)
-    closeSt.Color = YELLOW
-    closeSt.Thickness = 1
-    closeSt.Transparency = 0.4
     closeBtn.MouseButton1Click:Connect(function()
         M.destroyAntiTpBatGui()
         if M.setAntiTpBatPanelVisual then pcall(function() M.setAntiTpBatPanelVisual(false) end) end
@@ -13865,18 +13853,17 @@ function M.buildAntiTpBatGui()
 
     local toggleBtn = Instance.new("TextButton", content)
     toggleBtn.Size = UDim2.new(1, 0, 0, 36)
-    toggleBtn.BackgroundColor3 = BLACK_SOFT
+    toggleBtn.BackgroundColor3 = Color3.fromRGB(25, 25, 28)
     toggleBtn.BorderSizePixel = 0
     toggleBtn.Text = M.antiTpBatEnabled and "DEACTIVATE" or "ACTIVATE"
-    toggleBtn.TextColor3 = YELLOW
+    toggleBtn.TextColor3 = M.antiTpBatEnabled and GOLD or TEXT_SEC
     toggleBtn.Font = Enum.Font.GothamBlack
     toggleBtn.TextSize = 13
     toggleBtn.AutoButtonColor = false
     Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 8)
     local tStroke = Instance.new("UIStroke", toggleBtn)
-    tStroke.Color = YELLOW
-    tStroke.Thickness = 1.4
-    tStroke.Transparency = M.antiTpBatEnabled and 0.1 or 0.45
+    tStroke.Color = M.antiTpBatEnabled and GOLD or Color3.fromRGB(70, 70, 80)
+    tStroke.Thickness = 1.2
 
     local keyRow = Instance.new("Frame", content)
     keyRow.Size = UDim2.new(1, 0, 0, 30)
@@ -13886,7 +13873,7 @@ function M.buildAntiTpBatGui()
     keyLbl.Size = UDim2.new(0.5, 0, 1, 0)
     keyLbl.BackgroundTransparency = 1
     keyLbl.Text = "KEYBIND"
-    keyLbl.TextColor3 = YELLOW_SOFT
+    keyLbl.TextColor3 = TEXT_SEC
     keyLbl.Font = Enum.Font.GothamBold
     keyLbl.TextSize = 12
     keyLbl.TextXAlignment = Enum.TextXAlignment.Left
@@ -13895,31 +13882,25 @@ function M.buildAntiTpBatGui()
     keyBtn.AnchorPoint = Vector2.new(1, 0.5)
     keyBtn.Position = UDim2.new(1, 0, 0.5, 0)
     keyBtn.Size = UDim2.new(0, 70, 0, 26)
-    keyBtn.BackgroundColor3 = BLACK_BTN
+    keyBtn.BackgroundColor3 = Color3.fromRGB(20, 20, 22)
     keyBtn.BorderSizePixel = 0
     keyBtn.Text = (M.antiTpBatKey and M.antiTpBatKey.Name) or "T"
-    keyBtn.TextColor3 = YELLOW
+    keyBtn.TextColor3 = GOLD
     keyBtn.Font = Enum.Font.GothamBlack
     keyBtn.TextSize = 12
     keyBtn.AutoButtonColor = false
     Instance.new("UICorner", keyBtn).CornerRadius = UDim.new(0, 6)
-    local keySt = Instance.new("UIStroke", keyBtn)
-    keySt.Color = YELLOW
-    keySt.Thickness = 1
-    keySt.Transparency = 0.35
+    Instance.new("UIStroke", keyBtn).Color = Color3.fromRGB(70, 70, 80)
 
     function M._refreshAntiTpBatUI()
         if not (toggleBtn and toggleBtn.Parent) then return end
         local on = M.antiTpBatEnabled == true
         toggleBtn.Text = on and "DEACTIVATE" or "ACTIVATE"
-        toggleBtn.TextColor3 = YELLOW
-        toggleBtn.BackgroundColor3 = on and Color3.fromRGB(20, 16, 0) or BLACK_SOFT
-        tStroke.Color = YELLOW
-        tStroke.Transparency = on and 0.05 or 0.45
-        mainStroke.Color = YELLOW
+        toggleBtn.TextColor3 = on and GOLD or TEXT_SEC
+        tStroke.Color = on and GOLD or Color3.fromRGB(70, 70, 80)
+        mainStroke.Color = on and GOLD or GOLD_DIM
         if keyBtn and keyBtn.Parent and not M._antiTpBatAwaitingKey then
             keyBtn.Text = (M.antiTpBatKey and M.antiTpBatKey.Name) or "T"
-            keyBtn.TextColor3 = YELLOW
         end
     end
 
@@ -13931,7 +13912,7 @@ function M.buildAntiTpBatGui()
         if M._antiTpBatAwaitingKey then return end
         M._antiTpBatAwaitingKey = true
         keyBtn.Text = "..."
-        keyBtn.TextColor3 = YELLOW_SOFT
+        keyBtn.TextColor3 = Color3.fromRGB(255, 200, 100)
         local conn
         conn = UIS.InputBegan:Connect(function(input)
             if input.UserInputType == Enum.UserInputType.Keyboard and input.KeyCode ~= Enum.KeyCode.Unknown then
@@ -13940,12 +13921,13 @@ function M.buildAntiTpBatGui()
                 end
                 M._antiTpBatAwaitingKey = false
                 keyBtn.Text = M.antiTpBatKey.Name
-                keyBtn.TextColor3 = YELLOW
+                keyBtn.TextColor3 = GOLD
                 pcall(function() conn:Disconnect() end)
             end
         end)
     end)
 
+    -- global keybind (once)
     if not M._antiTpBatKeyConn then
         M._antiTpBatKeyConn = UIS.InputBegan:Connect(function(input, gp)
             if gp then return end
@@ -13956,6 +13938,7 @@ function M.buildAntiTpBatGui()
         end)
     end
 
+    -- character rebind while enabled
     if not M._antiTpBatCharConn then
         M._antiTpBatCharConn = player.CharacterAdded:Connect(function(char)
             task.defer(function()
